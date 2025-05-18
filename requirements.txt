@@ -1,3 +1,5 @@
 tk
 ttkthemes
 yt-dlp
+pandas
+openpyxl

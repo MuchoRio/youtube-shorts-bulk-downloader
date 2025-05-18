@@ -14,6 +14,9 @@ Sebuah aplikasi berbasis GUI (Graphical User Interface) menggunakan Python untuk
 *   Pilihan format/kualitas video yang dapat dipilih.
 *   Indikator progress dan status proses.
 *   Fungsi pembatalan proses yang sedang berjalan.
+*   Delay (Segera).
+*   Mencoba Kembali (Segera).
+*   Proxy (Segera)
 
 ## Persyaratan
 

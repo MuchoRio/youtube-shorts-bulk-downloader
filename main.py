@@ -7,18 +7,17 @@ import yt_dlp  # Pustaka untuk mendownload video dari YouTube dan situs lain
 import subprocess  # Untuk menjalankan perintah eksternal, di sini digunakan untuk yt-dlp
 import pandas as pd  # Pustaka untuk manipulasi data dan ekspor ke Excel/CSV
 import math # Untuk perhitungan batch
-import time # Untuk jeda saat polling proses subprocess
+import time # Untuk jeda antar download
 
-# --- Konfigurasi ---
+# --- Konfigurasi Default ---
 BATCH_SIZE = 100 # Jumlah video Shorts per batch/folder. Bisa diubah sesuai kebutuhan.
+DEFAULT_DOWNLOAD_DELAY_SECONDS = 5 # Nilai default jeda dalam detik antara setiap upaya download video.
+DEFAULT_RETRIES = 3 # Nilai default jumlah percobaan ulang download per video.
+ERROR_FOLDER_NAME = "batching_error" # Nama folder untuk menyimpan log error
 
 # Mapping nama format user-friendly ke string format yt-dlp
 # yt-dlp akan mencoba memilih format terbaik yang sesuai dengan kriteria ini.
 # Sintaks format selector: https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md#format-selection
-# bestvideo+bestaudio/best -> video dan audio terbaik, digabung (biasanya MP4/MKV)
-# bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4] -> video MP4 terbaik + audio M4A terbaik, digabung. Fallback ke format MP4 terbaik.
-# best[ext=webm] -> format tunggal terbaik dengan ekstensi webm (seringkali VP9/Opus)
-# [height<=X][ext=mp4] -> video dengan tinggi <= X dan ekstensi mp4
 FORMAT_OPTIONS = {
     "Best Quality (Default)": "bestvideo+bestaudio/best", # Kualitas terbaik, container otomatis (biasanya mp4/mkv)
     "Best Quality (MP4)": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]", # Prioritaskan MP4 container
@@ -36,14 +35,16 @@ current_subprocess = None # Menyimpan referensi ke proses yt-dlp yang sedang ber
 
 # --- Fungsi Utama ---
 
-def get_shorts_metadata(channel_url, num_videos_limit, progress_label_var):
+def get_shorts_metadata(channel_url, num_videos_limit, proxy, progress_label_var):
     """
     Mengambil metadata (URL, Title, Description) dari video Shorts channel YouTube tertentu.
     Mencoba mengambil semua Shorts yang tersedia atau hingga batas num_videos_limit.
+    Mendukung penggunaan proxy.
 
     Args:
         channel_url (str): URL channel YouTube.
         num_videos_limit (int or None): Jumlah maksimum video yang akan diambil metadatanya. None untuk semua.
+        proxy (str or None): Alamat proxy (misal: "http://host:port"). None atau string kosong jika tidak pakai proxy.
         progress_label_var (tk.StringVar): Variabel Tkinter untuk mengupdate teks label status.
 
     Returns:
@@ -57,6 +58,12 @@ def get_shorts_metadata(channel_url, num_videos_limit, progress_label_var):
         'ignoreerrors': True, # Lanjutkan meskipun ada error pada satu atau beberapa video
         'no_warnings': True, # Sembunyikan peringatan
     }
+
+    # Tambahkan opsi proxy jika disediakan
+    if proxy:
+        ydl_opts['proxy'] = proxy
+        print(f"Using proxy for metadata fetch: {proxy}")
+
 
     # Batasi jumlah item playlist jika num_videos_limit diberikan
     if num_videos_limit is not None and num_videos_limit > 0:
@@ -185,53 +192,68 @@ def save_metadata_to_excel(metadata_list, output_filepath):
         return False
 
 
-def download_videos_from_links(links, output_path, format_string, progress_var, progress_label_var, batch_info="", cancel_event=None):
+def download_videos_from_links(links, output_path, format_string, retries, download_delay_seconds, proxy, progress_var, progress_label_var, batch_info="", cancel_event=None):
     """
     Mendownload daftar video dari URL yang diberikan menggunakan subprocess yt-dlp
-    ke dalam direktori output yang ditentukan, dengan pilihan format dan pembatalan.
+    ke dalam direktori output yang ditentukan, dengan pilihan format, retries, delay, proxy, dan pembatalan.
 
     Args:
         links (list): Daftar string URL video yang akan didownload.
         output_path (str): Path direktori tempat video akan disimpan (subfolder batch).
         format_string (str): String format yt-dlp yang akan digunakan (misal: "bestvideo+bestaudio/best").
+        retries (int): Jumlah percobaan ulang download per video.
+        download_delay_seconds (int): Jeda dalam detik antara setiap upaya download video.
+        proxy (str or None): Alamat proxy (misal: "http://host:port"). None atau string kosong jika tidak pakai proxy.
         progress_var (tk.IntVar): Variabel Tkinter untuk mengupdate nilai progress bar.
         progress_label_var (tk.StringVar): Variabel Tkinter untuk mengupdate teks label status.
         batch_info (str): String tambahan untuk label status (misal: "Batch 1/5").
         cancel_event (threading.Event or None): Event untuk memeriksa apakah proses dibatalkan.
+
+    Returns:
+        list: Daftar URL video yang gagal didownload dalam batch ini.
     """
     global current_subprocess # Deklarasikan untuk memodifikasi variabel global
 
     total_links = len(links)
+    failed_links_in_batch = [] # List untuk menyimpan URL yang gagal dalam batch ini
+
     if total_links == 0:
         progress_label_var.set(f"{batch_info} Step 3/3: No videos to download in this batch.")
         progress_var.set(0)
-        return
+        return failed_links_in_batch # Kembalikan list kosong
 
-    print(f"{batch_info} Starting download of {total_links} videos into {output_path} with format '{format_string}'...") # Debugging/Informasi
+    print(f"{batch_info} Starting download of {total_links} videos into {output_path} with format '{format_string}', retries={retries}, delay={download_delay_seconds}s, proxy={proxy if proxy else 'None'}...") # Debugging/Informasi
 
     for index, link in enumerate(links, start=1):
+        # --- Cek Pembatalan Sebelum Memulai Download Video Berikutnya ---
         if cancel_event and cancel_event.is_set():
             print(f"{batch_info} Download cancelled by user.")
             progress_label_var.set(f"{batch_info} Download cancelled.")
             break # Keluar dari loop download jika dibatalkan
+        # --- End Cek Pembatalan ---
 
         link = link.strip() # Hapus spasi di awal/akhir link
         # Update label status sebelum memulai download
         progress_label_var.set(f"{batch_info} Step 3/3: Downloading video {index}/{total_links}...")
 
         try:
-            # Menjalankan yt-dlp sebagai subprocess menggunakan Popen untuk kontrol
-            # '--output': Menentukan format nama file output di dalam output_path
-            # '--format': Menentukan format/kualitas video yang didownload
-            # '--no-part': Mencegah yt-dlp menggunakan file .part (opsional, bisa membantu dengan pembatalan)
+            # Menjalankan yt-dlp sebagai subprocess menggunakan Popen untuk control
             command = [
                 'yt-dlp',
                 '--quiet',
                 '--no-part', # Opsional: jangan gunakan file .part
+                '--retries', str(retries), # Menggunakan nilai retries dari input GUI
                 '--output', os.path.join(output_path, '%(title)s.%(ext)s'),
-                '--format', format_string, # Tambahkan opsi format
-                link
+                '--format', format_string, # Menggunakan nilai format dari input GUI
             ]
+
+            # Tambahkan opsi proxy jika disediakan
+            if proxy:
+                command.extend(['--proxy', proxy])
+
+            # Tambahkan link video terakhir
+            command.append(link)
+
             print(f"Executing command: {' '.join(command)}") # Debugging: tampilkan perintah lengkap
 
             current_subprocess = subprocess.Popen(
@@ -241,12 +263,14 @@ def download_videos_from_links(links, output_path, format_string, progress_var, 
                 text=True # Menggunakan teks untuk output yang ditangkap
             )
 
-            # Tunggu subprocess selesai sambil memeriksa sinyal pembatalan
-            # Menggunakan communicate() dengan timeout lebih aman untuk menangani output
+            # Tunggu subprocess selesai. Menggunakan communicate() dengan timeout=None
+            # adalah cara sederhana untuk menunggu tanpa polling manual yang kompleks.
+            # Pembatalan ditangani oleh on_cancel_button_click yang me-kill subprocess.
             try:
-                stdout, stderr = current_subprocess.communicate(timeout=99999) # Gunakan timeout besar atau None jika tidak ingin timeout
+                stdout, stderr = current_subprocess.communicate(timeout=None) # Tunggu tanpa timeout
                 return_code = current_subprocess.returncode
             except subprocess.TimeoutExpired:
+                 # Ini seharusnya tidak terjadi dengan timeout=None, tapi tetap jaga
                 print(f"{batch_info} yt-dlp process for {link} timed out.")
                 current_subprocess.kill() # Paksa hentikan jika timeout
                 stdout, stderr = current_subprocess.communicate()
@@ -264,11 +288,22 @@ def download_videos_from_links(links, output_path, format_string, progress_var, 
                 # Jika yt-dlp mengembalikan kode error non-zero (dan tidak dibatalkan)
                 error_msg = f"yt-dlp failed for {link} (code {return_code}): {stderr.strip() if stderr else 'No error message'}"
                 print(error_msg)
+                # --- Peningkatan Feedback GUI ---
                 progress_label_var.set(f"{batch_info} Step 3/3: Video {index}/{total_links} failed.") # Pesan lebih ringkas
+                # --- End Peningkatan Feedback GUI ---
                 # messagebox.showwarning("Download Failed", f"Failed to download {link}:\n{error_msg}") # Opsional: tampilkan peringatan per video
+                # --- Tambahkan URL ke daftar gagal ---
+                failed_links_in_batch.append(link)
+                # --- End Tambahkan URL ---
+                # --- Lanjutkan ke video berikutnya meskipun gagal ---
+                # Tidak menggunakan 'break' di sini agar error pada satu video tidak menghentikan seluruh batch
+                pass
+                # --- End Lanjutkan ---
             else:
                 # Update label status setelah berhasil
+                # --- Peningkatan Feedback GUI ---
                 progress_label_var.set(f"{batch_info} Step 3/3: Video {index}/{total_links} downloaded.") # Pesan lebih ringkas
+                # --- End Peningkatan Feedback GUI ---
                 print(f"{batch_info} Successfully downloaded: {link}") # Debugging/Informasi
 
         except FileNotFoundError:
@@ -277,24 +312,112 @@ def download_videos_from_links(links, output_path, format_string, progress_var, 
              progress_label_var.set(error_msg)
              messagebox.showerror("Error", error_msg) # Tampilkan pesan error di GUI
              # Hentikan proses download jika yt-dlp tidak ditemukan
+             # --- Tambahkan sisa link di batch ke daftar gagal karena proses terhenti ---
+             failed_links_in_batch.extend(links[index-1:]) # Tambahkan link saat ini dan sisa link
+             # --- End Tambahkan sisa link ---
              break # Keluar dari loop download untuk batch ini
         except Exception as e:
             error_msg = f"An unexpected error occurred while downloading {link}: {e}"
             print(error_msg)
+            # --- Peningkatan Feedback GUI ---
             progress_label_var.set(f"{batch_info} Step 3/3: Video {index}/{total_links} failed.") # Pesan lebih ringkas
+            # --- End Peningkatan Feedback GUI ---
             # messagebox.showwarning("Download Failed", f"Failed to download {link}:\n{error_msg}") # Opsional: tampilkan peringatan per video
+            # --- Tambahkan URL ke daftar gagal ---
+            failed_links_in_batch.append(link)
+            # --- End Tambahkan URL ---
+            # --- Lanjutkan ke video berikutnya meskipun gagal ---
+            pass
+            # --- End Lanjutkan ---
         finally:
             # Update progress bar setelah setiap video (berhasil atau gagal/dibatalkan)
             # Progress bar ini menunjukkan progress DALAM batch saat ini
             # Jika dibatalkan, progress bar mungkin tidak mencapai 100% untuk batch ini
             progress_var.set(int((index / total_links) * 100))
 
-    # Setelah loop selesai untuk batch ini (baik selesai semua atau dibatalkan)
+            # --- Tambahkan Jeda Antar Download ---
+            # Jeda hanya jika bukan video terakhir dalam batch dan proses belum dibatalkan
+            if index < total_links and not (cancel_event and cancel_event.is_set()):
+                print(f"Waiting for {download_delay_seconds} seconds before next download...")
+                time.sleep(download_delay_seconds)
+            # --- End Tambahkan Jeda ---
+
+
+    # Setelah loop selesai untuk batch ini (baik selesai semua, ada yang gagal, atau dibatalkan)
     if not (cancel_event and cancel_event.is_set()):
         batch_finish_status = f"{batch_info} Step 3/3: Finished downloading videos for this batch."
         progress_label_var.set(batch_finish_status)
         print(batch_finish_status) # Debugging/Informasi
         # progress_var.set(100) # Opsional: Pastikan progress bar penuh di akhir batch jika tidak dibatalkan
+
+    return failed_links_in_batch # Kembalikan daftar URL yang gagal
+
+
+def save_metadata_to_excel(metadata_list, output_filepath):
+    """
+    Menyimpan daftar metadata Shorts ke dalam file Excel di lokasi spesifik.
+
+    Args:
+        metadata_list (list): Daftar dictionary berisi metadata Shorts untuk batch ini.
+        output_filepath (str): Path lengkap file Excel yang akan disimpan (termasuk nama file).
+
+    Returns:
+        bool: True jika berhasil menyimpan, False jika gagal.
+    """
+    if not metadata_list:
+        print(f"No metadata to save to Excel file: {output_filepath}")
+        return False
+
+    try:
+        # Buat DataFrame pandas dari list metadata
+        df = pd.DataFrame(metadata_list)
+
+        # Urutkan kolom sesuai keinginan
+        df = df[['url', 'title', 'description']]
+
+        # Ganti nama kolom agar lebih user-friendly di Excel
+        df.rename(columns={'url': 'Link URL', 'title': 'Title', 'description': 'Description'}, inplace=True)
+
+        # Simpan DataFrame ke file Excel
+        df.to_excel(output_filepath, index=False) # index=False agar tidak menyimpan index DataFrame
+
+        print(f"Successfully saved metadata to {output_filepath}")
+        return True
+    except Exception as e:
+        print(f"Error saving metadata to Excel file {output_filepath}: {e}")
+        return False
+
+def save_failed_urls_to_file(failed_urls, output_directory, batch_number):
+    """
+    Menyimpan daftar URL yang gagal ke file error.txt di subfolder error batch.
+
+    Args:
+        failed_urls (list): Daftar string URL yang gagal.
+        output_directory (str): Path direktori utama tempat folder error akan dibuat.
+        batch_number (int): Nomor batch.
+    """
+    if not failed_urls:
+        print(f"No failed URLs to save for Batch {batch_number}.")
+        return
+
+    # Buat path untuk folder error utama dan subfolder error batch
+    error_main_folder = os.path.join(output_directory, ERROR_FOLDER_NAME)
+    error_batch_folder = os.path.join(error_main_folder, f"Batch_{batch_number}_Errors")
+    error_filepath = os.path.join(error_batch_folder, "error.txt")
+
+    try:
+        # Buat folder error jika belum ada
+        os.makedirs(error_batch_folder, exist_ok=True)
+        print(f"Created error directory for Batch {batch_number}: {error_batch_folder}")
+
+        # Tulis URL yang gagal ke file error.txt
+        with open(error_filepath, 'w') as f:
+            for url in failed_urls:
+                f.write(url + '\n')
+
+        print(f"Successfully saved {len(failed_urls)} failed URLs to {error_filepath}")
+    except Exception as e:
+        print(f"Error saving failed URLs to file {error_filepath}: {e}")
 
 
 # --- Fungsi GUI ---
@@ -312,7 +435,7 @@ def browse_folder(folder_var):
         print(f"Main output folder selected: {folder_selected}") # Debugging/Informasi
 
 
-def on_start_button_click(folder_var, channel_entry, num_videos_entry, format_combobox, progress_var, progress_label_var, start_button, cancel_button):
+def on_start_button_click(folder_var, channel_entry, num_videos_entry, format_combobox, delay_entry, retries_entry, proxy_entry, progress_var, progress_label_var, start_button, cancel_button):
     """
     Fungsi yang dipanggil saat tombol 'Start Process' diklik.
     Memulai proses pengambilan metadata, batching, penyimpanan Excel, dan download video
@@ -323,6 +446,9 @@ def on_start_button_click(folder_var, channel_entry, num_videos_entry, format_co
         channel_entry (ttk.Entry): Widget entry yang berisi URL channel.
         num_videos_entry (ttk.Entry): Widget entry yang berisi jumlah video yang diinginkan.
         format_combobox (ttk.Combobox): Widget combobox untuk pilihan format.
+        delay_entry (ttk.Entry): Widget entry untuk download delay.
+        retries_entry (ttk.Entry): Widget entry untuk jumlah retries.
+        proxy_entry (ttk.Entry): Widget entry untuk alamat proxy.
         progress_var (tk.IntVar): Variabel Tkinter untuk progress bar.
         progress_label_var (tk.StringVar): Variabel Tkinter untuk label status.
         start_button (ttk.Button): Tombol Start Process.
@@ -333,6 +459,7 @@ def on_start_button_click(folder_var, channel_entry, num_videos_entry, format_co
     num_videos_str = num_videos_entry.get().strip()
     selected_format_name = format_combobox.get()
     selected_format_string = FORMAT_OPTIONS.get(selected_format_name, FORMAT_OPTIONS["Best Quality (Default)"]) # Ambil string format yt-dlp
+    proxy_address = proxy_entry.get().strip() # Ambil alamat proxy
 
     # Validasi input dasar
     if not main_output_directory:
@@ -362,6 +489,40 @@ def on_start_button_click(folder_var, channel_entry, num_videos_entry, format_co
             print("Error: Non-integer number of videos entered.")
             return
 
+    # Validasi input delay
+    download_delay_seconds = DEFAULT_DOWNLOAD_DELAY_SECONDS # Default value
+    delay_str = delay_entry.get().strip()
+    if delay_str:
+        try:
+            download_delay_seconds = int(delay_str)
+            if download_delay_seconds < 0: # Allow 0 delay
+                 messagebox.showwarning("Invalid Input", "Download delay must be a non-negative integer.")
+                 progress_label_var.set("Invalid download delay.")
+                 print("Error: Invalid download delay entered.")
+                 return
+        except ValueError:
+            messagebox.showwarning("Invalid Input", "Please enter a valid number for download delay.")
+            progress_label_var.set("Invalid delay format.")
+            print("Error: Non-integer delay entered.")
+            return
+
+    # Validasi input retries
+    retries = DEFAULT_RETRIES # Default value
+    retries_str = retries_entry.get().strip()
+    if retries_str:
+        try:
+            retries = int(retries_str)
+            if retries < 0: # Allow 0 retries
+                 messagebox.showwarning("Invalid Input", "Number of retries must be a non-negative integer.")
+                 progress_label_var.set("Invalid number of retries.")
+                 print("Error: Invalid number of retries entered.")
+                 return
+        except ValueError:
+            messagebox.showwarning("Invalid Input", "Please enter a valid number for retries.")
+            progress_label_var.set("Invalid retries format.")
+            print("Error: Non-integer retries entered.")
+            return
+
     # Nonaktifkan tombol Start dan aktifkan tombol Cancel
     start_button.config(state=tk.DISABLED)
     cancel_button.config(state=tk.NORMAL)
@@ -371,7 +532,7 @@ def on_start_button_click(folder_var, channel_entry, num_videos_entry, format_co
     # --- Peningkatan Feedback GUI ---
     progress_label_var.set("Starting process...")
     # --- End Peningkatan Feedback GUI ---
-    print(f"Starting process for channel: {channel_url}, limit: {num_videos_limit if num_videos_limit is not None else 'All'}, format: {selected_format_name} ({selected_format_string})") # Debugging/Informasi
+    print(f"Starting process for channel: {channel_url}, limit: {num_videos_limit if num_videos_limit is not None else 'All'}, format: {selected_format_name} ({selected_format_string}), delay: {download_delay_seconds}s, retries: {retries}, proxy: {proxy_address if proxy_address else 'None'}") # Debugging/Informasi
 
     # Reset cancel event
     cancel_event.clear()
@@ -400,8 +561,8 @@ def on_start_button_click(folder_var, channel_entry, num_videos_entry, format_co
             progress_label_var.set("Step 1/3: Fetching all Shorts metadata...")
             # --- End Peningkatan Feedback GUI ---
             print("Fetching all Shorts metadata...")
-            # Ambil metadata, limit diterapkan di yt-dlp options
-            all_shorts_metadata = get_shorts_metadata(channel_url, num_videos_limit, progress_label_var)
+            # Ambil metadata, limit diterapkan di yt-dlp options, pass proxy
+            all_shorts_metadata = get_shorts_metadata(channel_url, num_videos_limit, proxy_address if proxy_address else None, progress_label_var)
 
             if cancel_event.is_set():
                  print("Process cancelled during metadata fetching.")
@@ -490,8 +651,27 @@ def on_start_button_click(folder_var, channel_entry, num_videos_entry, format_co
                      # --- Peningkatan Feedback GUI ---
                      # Status download per video diupdate di dalam download_videos_from_links
                      # --- End Peningkatan Feedback GUI ---
-                     # Pass format string dan cancel event
-                     download_videos_from_links(shorts_links_to_download, batch_output_directory, selected_format_string, progress_var, progress_label_var, batch_info=batch_info_str, cancel_event=cancel_event)
+                     # Pass format string, retries, delay, proxy, dan cancel event
+                     failed_urls_this_batch = download_videos_from_links(
+                         shorts_links_to_download,
+                         batch_output_directory,
+                         selected_format_string,
+                         retries,
+                         download_delay_seconds,
+                         proxy_address if proxy_address else None,
+                         progress_var,
+                         progress_label_var,
+                         batch_info=batch_info_str,
+                         cancel_event=cancel_event
+                     )
+
+                     # --- Simpan URL yang Gagal ke File Error ---
+                     if failed_urls_this_batch:
+                         progress_label_var.set(f"{batch_info_str} Saving failed URLs to error file...")
+                         print(f"{batch_info_str} Saving {len(failed_urls_this_batch)} failed URLs...")
+                         save_failed_urls_to_file(failed_urls_this_batch, main_output_directory, batch_number)
+                     # --- End Simpan URL yang Gagal ---
+
                 else:
                      # --- Peningkatan Feedback GUI ---
                      progress_label_var.set(f"{batch_info_str} Step 3/3: No valid links found for download in this batch.")
@@ -552,8 +732,9 @@ def on_cancel_button_click(start_button, cancel_button, progress_label_var):
     if current_subprocess and current_subprocess.poll() is None:
         try:
             print("Attempting to terminate running yt-dlp subprocess...")
-            current_subprocess.terminate() # Kirim sinyal terminasi
-            # current_subprocess.kill() # Opsi lebih kuat jika terminate tidak berhasil
+            # current_subprocess.terminate() # Kirim sinyal terminasi (lebih lembut)
+            current_subprocess.kill() # Kirim sinyal kill (lebih paksa)
+            print("yt-dlp subprocess terminated.")
         except Exception as e:
             print(f"Error terminating subprocess: {e}")
 
@@ -565,7 +746,7 @@ def on_cancel_button_click(start_button, cancel_button, progress_label_var):
 # Membuat jendela utama
 root = tk.Tk()
 root.title("Shorts Bulk DL & Metadata Batcher By Sewer") # Judul aplikasi diperbarui
-root.geometry("700x480") # Ukuran jendela awal (opsional, diperbesar sedikit)
+root.geometry("700x630") # Ukuran jendela awal (opsional, diperbesar sedikit)
 root.resizable(False, False) # Mencegah jendela diubah ukurannya (opsional)
 
 # Konfigurasi style untuk widget ttk (tema gelap)
@@ -630,15 +811,39 @@ format_combobox = ttk.Combobox(main_frame, values=list(FORMAT_OPTIONS.keys()), s
 format_combobox.grid(column=1, row=3, columnspan=2, sticky=(tk.W, tk.E), pady=5, padx=5)
 format_combobox.set("Best Quality (Default)") # Set nilai default
 
+# Label dan Entry untuk Download Delay
+delay_label = ttk.Label(main_frame, text="Download Delay (seconds):")
+delay_label.grid(column=0, row=4, sticky=tk.W, pady=5, padx=5)
+
+delay_entry = ttk.Entry(main_frame, width=10) # Entry untuk delay
+delay_entry.grid(column=1, row=4, sticky=tk.W, pady=5, padx=5)
+delay_entry.insert(0, str(DEFAULT_DOWNLOAD_DELAY_SECONDS)) # Set nilai default
+
+# Label dan Entry untuk Number of Retries
+retries_label = ttk.Label(main_frame, text="Number of Retries:")
+retries_label.grid(column=0, row=5, sticky=tk.W, pady=5, padx=5)
+
+retries_entry = ttk.Entry(main_frame, width=10) # Entry untuk retries
+retries_entry.grid(column=1, row=5, sticky=tk.W, pady=5, padx=5)
+retries_entry.insert(0, str(DEFAULT_RETRIES)) # Set nilai default
+
+# Label dan Entry untuk Proxy
+proxy_label = ttk.Label(main_frame, text="Proxy (optional, e.g., http://host:port):")
+proxy_label.grid(column=0, row=6, sticky=tk.W, pady=5, padx=5)
+
+proxy_entry = ttk.Entry(main_frame, width=30) # Entry untuk proxy
+proxy_entry.grid(column=1, row=6, columnspan=2, sticky=(tk.W, tk.E), pady=5, padx=5)
+
+
 # Frame untuk tombol Start dan Cancel
 button_frame = ttk.Frame(main_frame)
-button_frame.grid(column=0, row=4, columnspan=3, pady=15)
+button_frame.grid(column=0, row=7, columnspan=3, pady=15) # Row disesuaikan
 button_frame.columnconfigure(0, weight=1) # Agar tombol bisa di tengah
 button_frame.columnconfigure(1, weight=1)
 
 # Tombol untuk memulai proses batching
 start_button = ttk.Button(button_frame, text="Start Batch Process",
-                          command=lambda: on_start_button_click(folder_var, channel_entry, num_videos_entry, format_combobox, progress_var, progress_label_var, start_button, cancel_button))
+                          command=lambda: on_start_button_click(folder_var, channel_entry, num_videos_entry, format_combobox, delay_entry, retries_entry, proxy_entry, progress_var, progress_label_var, start_button, cancel_button))
 start_button.grid(column=0, row=0, padx=10) # Tambahkan padx antar tombol
 
 # Tombol untuk membatalkan proses
@@ -648,20 +853,21 @@ cancel_button.grid(column=1, row=0, padx=10)
 # Progress bar untuk menunjukkan kemajuan download (per batch)
 progress_var = tk.IntVar() # Variabel untuk nilai progress bar (0-100)
 progress_bar = ttk.Progressbar(main_frame, orient="horizontal", mode="determinate", variable=progress_var, style="Horizontal.TProgressbar")
-progress_bar.grid(column=0, row=5, columnspan=3, pady=5, sticky=(tk.W, tk.E))
+progress_bar.grid(column=0, row=8, columnspan=3, pady=5, sticky=(tk.W, tk.E)) # Row disesuaikan
 
 # Label untuk menampilkan status proses (termasuk info batch)
 progress_label_var = tk.StringVar() # Variabel untuk teks status
 progress_label = ttk.Label(main_frame, textvariable=progress_label_var, anchor=tk.CENTER) # anchor=tk.CENTER untuk teks di tengah
-progress_label.grid(column=0, row=6, columnspan=3, pady=5, sticky=(tk.W, tk.E))
+progress_label.grid(column=0, row=9, columnspan=3, pady=5, sticky=(tk.W, tk.E)) # Row disesuaikan
 
 # Label penjelasan langkah-langkah proses
-explanation_text = """Process Steps:
-1. Fetching metadata for Shorts (up to specified limit).
+explanation_text = f"""Process Steps:
+1. Fetching metadata for Shorts (up to specified limit, using proxy if provided).
 2. Saving metadata to Excel file(s) in batch folders.
-3. Downloading videos batch by batch with selected format/quality.""" # Teks diperbarui
+3. Downloading videos batch by batch with selected format/quality, delay, retries, and proxy.
+Failed video URLs will be saved to '{ERROR_FOLDER_NAME}/Batch_X_Errors/error.txt'.""" # Teks diperbarui
 explanation_label = ttk.Label(main_frame, text=explanation_text, justify=tk.LEFT, foreground="#AAAAAA", background="#2E2E2E")
-explanation_label.grid(column=0, row=7, columnspan=3, pady=10, padx=5, sticky=tk.W)
+explanation_label.grid(column=0, row=10, columnspan=3, pady=10, padx=5, sticky=tk.W) # Row disesuaikan
 
 
 # --- Menjalankan Aplikasi GUI ---
